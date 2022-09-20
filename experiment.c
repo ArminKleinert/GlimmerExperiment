@@ -28,7 +28,7 @@
 #define MIN_AFF_FOR_REPRO -32
 #define MIN_G_FOR_REPRO 1
 
-#define CH_MUTATION (1 << 30)
+#define CH_MUTATION 0x40000000
 #define MUTATION_SHIFT 31
 #define CH_PREFER_NEW 0
 #define CH_OTHER_GROUP 1000
@@ -89,7 +89,7 @@ int32_t choose32(int32_t c0, int32_t c1, uint32_t *rand_seed) {
 }
 
 int32_t maybe_flip_bit(int32_t n, uint32_t *rand_seed) {
-  if (CH_MUTATION && (*rand_seed = xorshift(*rand_seed)) % CH_MUTATION == 0) {
+  if (CH_MUTATION && (((*rand_seed = xorshift(*rand_seed)) % CH_MUTATION) == 0)) {
     *rand_seed = xorshift(*rand_seed);
     n ^= 1 << (*rand_seed % (MUTATION_SHIFT + 1));
   }
@@ -245,12 +245,19 @@ int main(int argc, char **argv) {
       int64_t best_score = -255;
       upto(inner_i, NUM_ENTITIES) {
         if (curr_i != inner_i) {
-          int64_t g = gravity(curr, entities + inner_i);
-          rand_seed = xorshift(rand_seed);
-          if (g > best_score ||
-              (CH_PREFER_NEW && (rand_seed % CH_PREFER_NEW == 0))) {
-            best_score = g;
-            best = entities + inner_i;
+          if (CH_PREFER_NEW && (rand_seed % CH_PREFER_NEW == 0)) {
+            int32_t i;
+            do {
+              rand_seed = xorshift(rand_seed);
+              i = rand_seed % NUM_ENTITIES;
+              best = entities + i;
+            } while (i != curr_i);
+          } else {
+            int64_t g = gravity(curr, entities + inner_i);
+            if (g > best_score) {
+              best_score = g;
+              best = entities + inner_i;
+            }
           }
         }
       }
