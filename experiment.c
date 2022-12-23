@@ -1,6 +1,7 @@
 
-#include <math.h>
-#include <omp.h>
+#include <limits.h>
+//#include <math.h>
+//#include <omp.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,32 +12,77 @@
 #include <time.h>
 #include <unistd.h>
 
-#define upto(v, max) for (ssize_t v = 0; v < max; v++)
+typedef int INDEX;
 
-#define NUM_GROUPS 3
-#define NUM_ATTR 4
-#define NUM_ENTITIES 48
-#define GENERATIONS 10000
+#define upto(v, max) for (INDEX v = 0; v < max; v++)
+#define downto(v, max, min) for (INDEX v = max; v >= min; v--)
+#define LOG_ERROR(msg)                                                         \
+  fprintf(stderr, "Error in file %s at line %d: %s.\n", __FILE__, __LINE__, msg)
 
-#define MIN_AFF -64
-#define MAX_AFF 64
-#define MIN_ATTR_PRIO -100
-#define MAX_ATTR_PRIO 100
+static uint32_t WHERE_AM_I_COUNTER = 0;
+#define WHERE_AM_I()                                                           \
+  do {                                                                         \
+    fprintf(stderr, "I am in file %s in line %d. (counter: %d)\n", __FILE__,   \
+            __LINE__, WHERE_AM_I_COUNTER++);                                   \
+    fflush(stderr);                                                            \
+  } while (0)
+
+#define NUM_ATTR 2 // Number of attributes.
+#define NUM_ENTITIES 4
+#define MAX_ENTITIES 1024
+#define MAX_CANDIDATES 4
+#define CURR_MAX_CANDIDATES(current_bound)                                     \
+  (MAX_CANDIDATES < current_bound ? MAX_CANDIDATES : current_bound)
+#define MIN_APPEAL 255
+#define GENERATIONS 5
+
+#define MIN_ATTR_PRIO -256
+#define MAX_ATTR_PRIO 255
 #define MIN_ATTR_VAL -128
-#define MAX_ATTR_VAL 255
+#define MAX_ATTR_VAL 127
 
-#define MIN_AFF_FOR_REPRO -32
-#define MIN_G_FOR_REPRO 1
+#define CHANCE_RAND_SHIFT                                                      \
+  8 // A 1 in CHANCE_RAND_SHIFT chance that a random mutation will occur
+#define MAX_SHIFT                                                              \
+  ((1 << 6) - 1) // If a random mutation occurs, a value between MAX_SHIFT and
+                 // -MAX_SHIFT will be added to the attribute.
 
-#define CH_MUTATION 0x40000000
-#define MUTATION_SHIFT 31
-#define CH_PREFER_NEW 0
-#define CH_OTHER_GROUP 1000
-#define OWN_GROUP_AFF_MOD 2
+#define INIT_SEED 0xDEAD10CC
 
-#define DO_SHUFFLE 1
+/*
+ * The algorithm:
+ * GENERATION(entities, BS, CandidateSets):
+ * - for every entity E do
+ * - - Order all other entities in order of desirability.
+ * - - Keep only the top MAX_CANDIDATES entities of and collect then into a set
+ * CS
+ * - - Add CS to CandidateSets (of E)
+ * - - Make BS the union of CS and BS
+ * - OUT_ENTITIES = empty_set
+ * - for every entity E do
+ * - - if E is not desired by any of its desired candidates, E does not get to
+ * reproduce
+ * - - if E is desired by any of its top candidates, they reproduce and the new
+ * entity is put into the OUT_ENTITIES set
+ * - - if OUT_ENTITIES is full, break out of the loop
+ * - Update the set of entities to be OUT_ENTITIES
+ *
+ * desirability(E1, E2):
+ * - rep_value = 0
+ * - for each attribute A of E2:
+ * - - rep_value += A * priority(E1, attribute)
+ * - return rep_value
+ *
+ * reproduce(E1, E2):
+ * - E3 = empty_entity
+ * - for each attribute type A
+ * - - Choose a random value between (inclusive) attr_val(A, E1) and attr_val(A,
+ * E2)
+ * - - attr_val(A, E3) := that value
+ * - return E3
+ */
 
-uint32_t xorshift(uint32_t state) {
+static uint32_t xorshift(uint32_t state) {
   uint32_t x = state;
   x ^= x << 13;
   x ^= x >> 17;
@@ -45,237 +91,309 @@ uint32_t xorshift(uint32_t state) {
 }
 
 typedef struct {
-  int32_t group;
-  int32_t affinities[NUM_GROUPS]; // How much the entity likes each group
-  int32_t attr_prio[NUM_ATTR];    // How much the entity values each attribute
-  int32_t attr_vals[NUM_ATTR];    // The attribute values of the entity
+  int32_t attr_prio[NUM_ATTR]; // How much the entity values each attribute
+  int32_t attr_vals[NUM_ATTR]; // The attribute values of the entity
+  int32_t entity_id;
 } ENTITY;
 
-ENTITY entities[NUM_ENTITIES];
-ENTITY buffer_entities[NUM_ENTITIES];
-
-void shuffle_entities(uint32_t *rand_seed) {
-  uint32_t rseed = *rand_seed;
-  if (NUM_ENTITIES > 1) {
-    upto(i, NUM_ENTITIES - 1) {
-      size_t j = i + (rseed = xorshift(rseed)) % (NUM_ENTITIES - i);
-      ENTITY t = entities[j];
-      entities[j] = entities[i];
-      entities[i] = t;
-    }
-  }
-}
-
-int64_t reproductional_value(const ENTITY *entity0, const ENTITY *other) {
+static int64_t desirability(const ENTITY *admirer, const ENTITY *other) {
   int64_t rv = 0;
-  const int32_t *prio = entity0->attr_prio;
+  const int32_t *prio = admirer->attr_prio;
   const int32_t *vals = other->attr_vals;
 
-  // Calculate reproductional_value
-  for (int i = 0; i < NUM_ATTR; i++) {
+  // Calculate desirability
+  for (INDEX i = 0; i < NUM_ATTR; i++) {
     rv += prio[i] * vals[i];
   }
 
-  return rv;
+  if (rv < MIN_APPEAL) {
+    return INT_MIN;
+  } else {
+    return rv;
+  }
 }
 
 // Choose one of 2 inputs (ca. 50% chance each)
-int32_t choose32(int32_t c0, int32_t c1, uint32_t *rand_seed) {
+static int32_t choose32(int32_t c0, int32_t c1, uint32_t *rand_seed) {
   *rand_seed = xorshift(*rand_seed);
+  int32_t c_out;
   if (*rand_seed & 1)
-    return c0;
+    c_out = c0;
   else
-    return c1;
-}
+    c_out = c1;
 
-int32_t maybe_flip_bit(int32_t n, uint32_t *rand_seed) {
-  if (CH_MUTATION && (((*rand_seed = xorshift(*rand_seed)) % CH_MUTATION) == 0)) {
+  *rand_seed = xorshift(*rand_seed);
+  int do_shift = (*rand_seed) % 1 == 0;
+  if (do_shift) {
+    *rand_seed = xorshift(*rand_seed) % MAX_SHIFT;
+    int32_t shift_value = (int32_t)(*rand_seed);
+
     *rand_seed = xorshift(*rand_seed);
-    n ^= 1 << (*rand_seed % (MUTATION_SHIFT + 1));
-  }
-  return n;
-}
+    int direction = (*rand_seed) & 1;
 
-void make_child(ENTITY *par0, ENTITY *par1, ENTITY *child,
-                uint32_t *rand_seed) {
-  // Group of child depends on who cared more abou the other.
-  // There is a 1/4 chance that the other group is used instead.
-  int64_t rv01 = reproductional_value(par0, par1);
-  int64_t rv10 = reproductional_value(par1, par0);
-  int32_t rand_factor =
-      (*rand_seed = xorshift(*rand_seed)) % (CH_OTHER_GROUP + 1);
-  int32_t group = (rv01 < rv10 && rand_factor) ? par1->group : par0->group;
-
-  child->group = group;
-  upto(i, NUM_GROUPS) {
-    child->affinities[i] =
-        choose32(par0->affinities[i], par1->affinities[i], rand_seed);
-
-    if (i == group && OWN_GROUP_AFF_MOD != 0) {
-      child->affinities[i] +=
-          (*rand_seed = xorshift(*rand_seed)) % OWN_GROUP_AFF_MOD;
+    if (direction) {
+      c_out += shift_value;
+    } else {
+      c_out -= shift_value;
     }
-
-    child->affinities[i] = maybe_flip_bit(child->affinities[i], rand_seed);
   }
-
-  upto(i, NUM_ATTR) {
-    child->attr_prio[i] =
-        choose32(par0->attr_prio[i], par1->attr_prio[i], rand_seed);
-    child->attr_prio[i] = maybe_flip_bit(child->attr_prio[i], rand_seed);
-  }
-
-  upto(i, NUM_ATTR) {
-    child->attr_vals[i] =
-        choose32(par0->attr_vals[i], par1->attr_vals[i], rand_seed);
-    child->attr_vals[i] = maybe_flip_bit(child->attr_vals[i], rand_seed);
-  }
+  return c_out;
 }
 
-void reproduce(ENTITY *entity0, ENTITY *entity1, uint32_t *rand_seed) {
-  ptrdiff_t e0_idx = entity0 - entities;
-  make_child(entity0, entity1, buffer_entities + e0_idx, rand_seed);
-
-  /*
-  if (((*rand_seed = xorshift(*rand_seed)) % 16) != 0) {
-  ptrdiff_t e1_idx = entity1 - entities;
-  make_child(entity0, entity1, buffer_entities+e1_idx, rand_seed);
-}
-*/
-}
-
-void finalize_generation(void) {
-  memcpy(entities, buffer_entities, sizeof(entities));
-}
-
-int32_t affinity_multiplier(const int32_t *affinities, int32_t group) {
-  int32_t affinity = affinities[group];
-  /*
-  if (affinity < -64) {
-    return -2;
-  } else if (affinity < 0) {
-    return 1;
-  } else if (affinity < 64) {
-    return 4;
-  } else {
-    return 8;
-  }
-  */
-  return affinity;
-}
-
-int64_t gravity(const ENTITY *entity0, const ENTITY *other) {
-  int64_t g = reproductional_value(entity0, other);
-  int64_t aff = affinity_multiplier(entity0->affinities, other->group);
-
-  if (g < MIN_G_FOR_REPRO || aff < MIN_AFF_FOR_REPRO) {
-    return 0;
-  }
-
-  return g * aff;
-}
-
-#define PART_FORMAT "%04d"
-void print_arr(FILE *stream, const int len, const int32_t *arr) {
+#define PART_FORMAT "%4d"
+static void print_arr(FILE *stream, const INDEX len, const int32_t *arr) {
   fprintf(stream, " (");
-  for (int i = 0; i < len; i++) {
+  for (INDEX i = 0; i < len; i++) {
     fprintf(stream, PART_FORMAT, arr[i]);
-    if (i < len - 1)
+    if (i < len - 1) {
       fprintf(stream, " ");
+    }
   }
   fprintf(stream, ")");
 }
 
-void print_entity(FILE *stream, const ENTITY *entity0) {
-  if (entity0->group != 0xFFFF) {
-    fprintf(stream, PART_FORMAT, entity0->group);
-    print_arr(stream, NUM_GROUPS, entity0->affinities);
-    print_arr(stream, NUM_ATTR, entity0->attr_prio);
-    print_arr(stream, NUM_ATTR, entity0->attr_vals);
-  }
+static void print_entity(FILE *stream, const ENTITY *entity0) {
+  printf(PART_FORMAT, entity0->entity_id);
+  print_arr(stream, NUM_ATTR, entity0->attr_vals);
+  printf(" ");
+  print_arr(stream, NUM_ATTR, entity0->attr_prio);
 }
 
-void randomize_arr(uint32_t *seed, const int len, const int32_t min_bound,
-                   const int32_t max_bound, int32_t *arr) {
-  int32_t lower_b = min_bound < 0 ? -min_bound : min_bound;
-  int32_t higher_b = min_bound < 0 ? max_bound + lower_b : max_bound - lower_b;
-  for (int i = 0; i < len; i++) {
+static void randomize_arr(uint32_t *seed, const INDEX len,
+                          const int32_t min_bound, const int32_t max_bound,
+                          int32_t *arr) {
+  const int32_t low_b = min_bound < 0 ? -min_bound : min_bound;
+  const int32_t high_b = min_bound < 0 ? max_bound + low_b : max_bound - low_b;
+  for (INDEX i = 0; i < len; i++) {
     *seed = xorshift(*seed);
-    arr[i] = (*seed & 0x7FFFFFFF) % higher_b - lower_b;
+    arr[i] = (*seed & 0x7FFFFFFF) % high_b - low_b;
   }
 }
 
-void print_all_entities(void) {
-  upto(j, NUM_ENTITIES) {
-    print_entity(stdout, &(entities[j]));
+static void make_random_entities(uint32_t *rand_seed, ENTITY *entities,
+                                 const INDEX used_entities) {
+  upto(i, used_entities) {
+    ENTITY *e = entities + i;
+    e->entity_id = i;
+    randomize_arr(rand_seed, NUM_ATTR, MIN_ATTR_PRIO, MAX_ATTR_PRIO,
+                  e->attr_prio);
+    randomize_arr(rand_seed, NUM_ATTR, MIN_ATTR_VAL, MAX_ATTR_VAL,
+                  e->attr_vals);
+  }
+}
+
+static void print_all_entities(const INDEX used_entities, ENTITY *entities) {
+  upto(entity_index, used_entities) {
+    print_entity(stdout, &(entities[entity_index]));
     printf("\n");
   }
   printf("\n");
 }
 
+// Sorts 2 arrays in reverse order, using the second array as the point of
+// comparison.
+static void insertion_sort(ENTITY *entities, int32_t *scores, INDEX used_len) {
+  int32_t key;
+  for (INDEX index = 1; index < used_len; index++) {
+    key = scores[index];
+    INDEX comparison_index = index - 1;
+
+    while (comparison_index >= 0 && scores[comparison_index] < key) {
+      scores[comparison_index + 1] = scores[comparison_index];
+      entities[comparison_index + 1] = entities[comparison_index];
+      comparison_index = comparison_index - 1;
+    }
+    scores[comparison_index + 1] = key;
+  }
+}
+
+static void do_reproduce(ENTITY *entity, ENTITY *other, ENTITY *new_entity,
+                         INDEX id, uint32_t *rand_seed) {
+  new_entity->entity_id = id;
+  upto(attr_index, NUM_ATTR) {
+    int32_t score = entity->attr_vals[attr_index];
+    int32_t other_score = other->attr_vals[attr_index];
+    uint32_t rand_score = choose32(score, other_score, rand_seed);
+    *rand_seed = rand_score;
+    new_entity->attr_vals[attr_index] = (int32_t)(*rand_seed);
+  }
+  upto(attr_index, NUM_ATTR) {
+    int32_t prio = entity->attr_prio[attr_index];
+    int32_t other_prio = other->attr_prio[attr_index];
+    uint32_t rand_prio = choose32(prio, other_prio, rand_seed);
+    *rand_seed = rand_prio;
+    new_entity->attr_prio[attr_index] = (int32_t)(*rand_seed);
+  }
+}
+
+// Return next available index in entity array
+static INDEX reproduce_if_possible(ENTITY *entity, ENTITY *new_entity_array,
+                                   ENTITY *old_entity_array,
+                                   const INDEX used_entities,
+                                   const INDEX next_available_index,
+                                   int32_t **candidate_sets,
+                                   uint32_t *rand_seed) {
+  INDEX new_max_index = next_available_index;
+  upto(current_entity, used_entities) { // IDs of all other entities
+    if (new_max_index >= MAX_ENTITIES - 1) {
+      break;
+    }
+    if (current_entity == entity->entity_id) {
+      continue; // Do not reproduce with self.
+    }
+    if (current_entity != entity->entity_id) {
+      // IDs in candidate set of other entity
+      upto(index_in_candidate_set, CURR_MAX_CANDIDATES(used_entities)) {
+        int32_t desired_id_of_candidate =
+            candidate_sets[current_entity][index_in_candidate_set];
+        if (desired_id_of_candidate == INT_MIN ||
+            new_max_index >= MAX_ENTITIES) {
+          break;
+        }
+        if (desired_id_of_candidate == entity->entity_id) {
+          ENTITY *old_entity = old_entity_array + current_entity;
+          ENTITY *new_entity = new_entity_array + new_max_index;
+          do_reproduce(entity, old_entity, new_entity, new_max_index,
+                       rand_seed);
+          new_max_index++;
+        }
+      }
+    }
+  }
+  return new_max_index;
+}
+
+// Returns number of used entities
+static INDEX generation(ENTITY *entities, ENTITY *buffer_entities,
+                        int32_t *entity_scores, int32_t **candidate_sets,
+                        int32_t **candidate_scores, INDEX used_entities,
+                        uint32_t *rand_seed) {
+  memcpy(buffer_entities, entities, used_entities * sizeof(ENTITY));
+
+  // memset(entity_scores, 0, MAX_ENTITIES * sizeof(int32_t));
+
+  // Calculate and save candidates for each entity.
+  upto(i, used_entities) {
+    entity_scores[i] = INT_MIN;
+    const ENTITY current = entities[i];
+    upto(inner, used_entities) {
+      if (i != inner) { // An entity does not have to rate itself.
+        const ENTITY e = entities[inner];
+        const int32_t score = desirability(&current, &e);
+        entity_scores[inner] = score;
+      }
+    }
+
+    // Sort entities by score.
+    insertion_sort(buffer_entities, entity_scores, used_entities);
+
+    // Copy the first MAX_CANDIDATES candidates from the buffer together with
+    // their scores.
+    upto(j, CURR_MAX_CANDIDATES(used_entities)) {
+      if (entity_scores[j] < MIN_APPEAL) {
+        candidate_scores[i][j] = INT_MIN;
+        candidate_sets[i][j] = INT_MIN;
+      } else {
+        candidate_scores[i][j] = entity_scores[j];
+        candidate_sets[i][j] = buffer_entities[j].entity_id;
+      }
+    }
+  }
+
+  INDEX next_entity_index = 0;
+  upto(entity_index, used_entities) {
+    if (entity_index < MAX_ENTITIES) {
+      next_entity_index = reproduce_if_possible(
+          entities + entity_index, buffer_entities, entities, used_entities,
+          next_entity_index, candidate_sets, rand_seed);
+      if (next_entity_index >= MAX_ENTITIES - 1) {
+        break;
+      }
+    }
+    if (next_entity_index >= MAX_ENTITIES - 1) {
+      break;
+    }
+  }
+
+  memcpy(entities, buffer_entities, next_entity_index * sizeof(ENTITY));
+
+  return next_entity_index;
+}
+
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
+  (void)WHERE_AM_I_COUNTER;
+
+  INDEX used_entities = NUM_ENTITIES;
+  ENTITY *entities = malloc(MAX_ENTITIES * sizeof(ENTITY));
+  ENTITY *buffer_entities = malloc(MAX_ENTITIES * sizeof(ENTITY));
+  int32_t **candidate_sets = malloc(MAX_ENTITIES * sizeof(int32_t *));
+  int32_t *entity_scores = malloc(MAX_ENTITIES * sizeof(int32_t));
+  int32_t **candidate_scores = malloc(MAX_ENTITIES * sizeof(int32_t *));
+
+  if (!(entities && buffer_entities && entity_scores && candidate_sets &&
+        candidate_scores)) {
+    LOG_ERROR("Could not allocate memory.");
+    free(entities);
+    free(buffer_entities);
+    free(candidate_sets);
+    free(entity_scores);
+    free(candidate_scores);
+    return 1;
+  }
+
+  upto(i, MAX_ENTITIES) {
+    candidate_sets[i] = malloc(MAX_CANDIDATES * sizeof(int32_t));
+    if (!candidate_sets[i]) {
+      LOG_ERROR("Could not allocate memory.");
+      downto(j, i, 0) {
+        free(candidate_sets[i]); // Go backwards and free
+      }
+      return 1;
+    }
+  }
+  upto(i, MAX_ENTITIES) {
+    candidate_scores[i] = malloc(MAX_CANDIDATES * sizeof(int32_t));
+    if (!candidate_scores[i]) {
+      LOG_ERROR("Could not allocate memory.");
+      downto(j, i, 0) {
+        free(candidate_scores[i]); // Go backwards and free
+      }
+      return 1;
+    }
+  }
+
+  uint32_t rand_seed = INIT_SEED;
+  make_random_entities(&rand_seed, entities, used_entities);
+
+  print_all_entities(used_entities, entities);
 
   struct timespec start, end;
   clock_gettime(CLOCK_MONOTONIC_RAW, &start);
 
-  uint32_t rand_seed = 0xDEAD10CC;
-  finalize_generation();
-  upto(i, NUM_ENTITIES) {
-    ENTITY *e = entities + i;
-    e->group = i / (NUM_ENTITIES / NUM_GROUPS);
-    // e->group = i % NUM_GROUPS;
-
-    randomize_arr(&rand_seed, NUM_GROUPS, MIN_AFF, MAX_AFF, e->affinities);
-    e->affinities[e->group] = 255;
-
-    randomize_arr(&rand_seed, NUM_ATTR, MIN_ATTR_PRIO, MAX_ATTR_PRIO,
-                  e->attr_prio);
-    randomize_arr(&rand_seed, NUM_ATTR, MIN_ATTR_VAL, MAX_ATTR_VAL,
-                  e->attr_vals);
-  }
-
-  print_all_entities();
-
   upto(gen, GENERATIONS) {
-    upto(curr_i, NUM_ENTITIES) {
-      ENTITY *curr = entities + curr_i;
-      ENTITY *best = entities;
-      int64_t best_score = -255;
-      upto(inner_i, NUM_ENTITIES) {
-        if (curr_i != inner_i) {
-          if (CH_PREFER_NEW && (rand_seed % CH_PREFER_NEW == 0)) {
-            int32_t i;
-            do {
-              rand_seed = xorshift(rand_seed);
-              i = rand_seed % NUM_ENTITIES;
-              best = entities + i;
-            } while (i != curr_i);
-          } else {
-            int64_t g = gravity(curr, entities + inner_i);
-            if (g > best_score) {
-              best_score = g;
-              best = entities + inner_i;
-            }
-          }
-        }
-      }
-      reproduce(curr, best, &rand_seed);
-    }
-    finalize_generation();
-    // print_all_entities();
-    if (DO_SHUFFLE)
-      shuffle_entities(&rand_seed);
+    used_entities =
+        generation(entities, buffer_entities, entity_scores, candidate_sets,
+                   candidate_scores, used_entities, &rand_seed);
   }
-
-  print_all_entities();
 
   clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+
+  print_all_entities(used_entities, entities);
 
   uint64_t delta_us = (end.tv_sec - start.tv_sec) * 1000000 +
                       (end.tv_nsec - start.tv_nsec) / 1000;
   printf("\nTime taken: %lu.%lums\n", delta_us / 1000, delta_us % 1000);
+
+  // Clean the house.
+  upto(i, MAX_ENTITIES) { free(candidate_sets[i]); }
+  upto(i, MAX_ENTITIES) { free(candidate_scores[i]); }
+  free(entities);
+  free(buffer_entities);
+  free(candidate_sets);
+  free(entity_scores);
+  free(candidate_scores);
 
   return 0;
 }
