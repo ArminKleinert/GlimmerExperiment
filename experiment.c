@@ -1,4 +1,3 @@
-
 #include <limits.h>
 //#include <math.h>
 //#include <omp.h>
@@ -27,14 +26,14 @@ static uint32_t WHERE_AM_I_COUNTER = 0;
     fflush(stderr);                                                            \
   } while (0)
 
-#define NUM_ATTR 2 // Number of attributes.
-#define NUM_ENTITIES 4
+#define NUM_ATTR 6 // Number of attributes.
+#define NUM_ENTITIES 5
 #define MAX_ENTITIES 1024
 #define MAX_CANDIDATES 4
 #define CURR_MAX_CANDIDATES(current_bound)                                     \
   (MAX_CANDIDATES < current_bound ? MAX_CANDIDATES : current_bound)
-#define MIN_APPEAL 255
-#define GENERATIONS 5
+#define MIN_APPEAL 0
+#define GENERATIONS 78
 
 #define MIN_ATTR_PRIO -256
 #define MAX_ATTR_PRIO 255
@@ -76,8 +75,7 @@ static uint32_t WHERE_AM_I_COUNTER = 0;
  * reproduce(E1, E2):
  * - E3 = empty_entity
  * - for each attribute type A
- * - - Choose a random value between (inclusive) attr_val(A, E1) and attr_val(A,
- * E2)
+ * - - Choose one of attr_val(A, E1) and attr_val(A, E2)
  * - - attr_val(A, E3) := that value
  * - return E3
  */
@@ -376,6 +374,10 @@ int main(int argc, char **argv) {
     used_entities =
         generation(entities, buffer_entities, entity_scores, candidate_sets,
                    candidate_scores, used_entities, &rand_seed);
+    if (used_entities == 0) {
+      printf("The entities died out. (Generation %d)\n", gen);
+      break;
+    }
   }
 
   clock_gettime(CLOCK_MONOTONIC_RAW, &end);
