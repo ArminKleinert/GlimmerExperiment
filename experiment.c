@@ -33,7 +33,7 @@ static uint32_t WHERE_AM_I_COUNTER = 0;
 #define CURR_MAX_CANDIDATES(current_bound)                                     \
   (MAX_CANDIDATES < current_bound ? MAX_CANDIDATES : current_bound)
 #define MIN_APPEAL 0
-#define GENERATIONS 78
+#define GENERATIONS 79
 
 #define MIN_ATTR_PRIO -256
 #define MAX_ATTR_PRIO 255
